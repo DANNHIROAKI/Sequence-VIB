@@ -1,0 +1,44 @@
+config_file: configs/electricity.yaml
+
+datasets:
+  - electricity
+
+prediction_lengths:
+  - 96
+  - 192
+  - 336
+  - 720
+
+data:
+  data_path: ./data/
+  features: 321
+  seq_len: 96
+
+model:
+  d_model: 256
+  d_state: 80
+  gate_hidden: 256
+  dropout: 0.1
+  min_dt: 0.01
+  max_dt: 1.0
+  feedback_delta: 0.3
+  feedback_matrix: 0.3
+
+training:
+  batch_size: 32
+  learning_rate: 0.0006
+  max_epochs: 120
+  patience: 6
+  seed: 2025
+  scoring: nll
+  recon_weight: 0.1
+  rate_budget: 0.04
+  dual_step: 0.07
+  lambda_init: 0.1
+
+lambda_search:
+  default: 0.1
+  values: [0.01, 0.05, 0.1, 0.5, 1.0]
+
+hardware:
+  num_gpus: 8

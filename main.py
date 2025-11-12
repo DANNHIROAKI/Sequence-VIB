@@ -42,7 +42,7 @@ class ExperimentOrchestrator:
         为给定的数据集和预测长度查找最佳lambda值。
         """
         search_dir = self.results_dir / "lambda_search"
-        best_lambda = 0.0  # 如果找不到，默认为0.0
+        best_lambda = 0.0
         best_val_loss = float('inf')
 
         # 构造文件匹配模式
@@ -53,9 +53,10 @@ class ExperimentOrchestrator:
             try:
                 with open(f, 'r') as res_file:
                     data = json.load(res_file)
-                    if data.get('val_loss', float('inf')) < best_val_loss:
-                        best_val_loss = data['val_loss']
-                        best_lambda = data.get('lambda_val', 0.0)
+                    candidate_val = data.get('val_pred_loss', data.get('val_loss', float('inf')))
+                    if candidate_val < best_val_loss:
+                        best_val_loss = candidate_val
+                        best_lambda = data.get('final_lambda', data.get('initial_lambda', 0.0))
             except (json.JSONDecodeError, KeyError):
                 # 如果文件损坏或格式不正确，则跳过
                 continue

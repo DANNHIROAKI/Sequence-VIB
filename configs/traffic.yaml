@@ -1,39 +1,48 @@
 config_file: configs/traffic.yaml
+
+datasets:
+  - traffic
+
+prediction_lengths:
+  - 96
+  - 192
+  - 336
+  - 720
+
 data:
   data_path: ./data/
   features: 862
   seq_len: 96
-datasets:
-- traffic
+
+model:
+  d_model: 256
+  d_state: 96
+  gate_hidden: 256
+  dropout: 0.1
+  min_dt: 0.01
+  max_dt: 1.0
+  feedback_delta: 0.3
+  feedback_matrix: 0.25
+
+training:
+  batch_size: 16
+  learning_rate: 0.0005
+  max_epochs: 120
+  patience: 8
+  seed: 2024
+  scoring: nll
+  recon_weight: 0.05
+  rate_budget: 0.03
+  dual_step: 0.05
+  lambda_init: 0.05
+
+lambda_search:
+  default: 0.05
+  values: [0.01, 0.05, 0.1, 0.5, 1.0]
+
 hardware:
   num_gpus: 8
-lambda_search:
-  default: 0.01
-  values:
-  - 0.01
-  - 0.1
-  - 1.0
-  - 2.0
-  - 5.0
-  - 10.0
-  - 50.0
-  - 100.0
-logging:
-  save_frequency: 10
-  verbose: true
-model:
-  d_model: 128
-  d_state: 16
-  decoder_hidden_dim: 64
-  decoder_layers: 2
-  dt_rank: auto
-  expand_factor: 2
-  n_layers: 4
-prediction_lengths:
-- 96
-- 192
-- 336
-- 720
+
 robustness:
   impulse_noise:
     magnitude_factor: 5.0
@@ -42,9 +51,3 @@ robustness:
     amplitude_factor: 0.5
     correlation_strength: 0.7
     frequency: 0.1
-training:
-  batch_size: 16
-  learning_rate: 0.001
-  max_epochs: 100
-  patience: 3
-  seed: 2024

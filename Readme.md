@@ -51,17 +51,17 @@ The experimental pipeline consists of two stages:
 
 ### Stage 1: Lambda Hyperparameter Search
 ```bash
-python main.py --mode lambda_search --config configs/etth_config.yaml
+python main.py --mode lambda_search --config configs/ett_config.yaml
 ```
 
 This will run experiments across all combinations of datasets, prediction lengths, and lambda values to find the optimal regularization strength.
 
 ### Stage 2: Final Training and Evaluation
 ```bash
-python main.py --mode final_run --config configs/etth_config.yaml
+python main.py --mode test_only --config configs/ett_config.yaml
 ```
 
-This stage uses the best lambda values from Stage 1 to train final models and evaluate their performance, including robustness tests.
+This stage reloads the best checkpoints from Stage 1, evaluates them under the Seq-MPS objectives, and runs the bundled robustness suites.
 
 ### Stage 3: Summarize Results
 ```bash
