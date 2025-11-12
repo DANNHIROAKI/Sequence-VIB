@@ -3,7 +3,7 @@
 This repository contains the implementation of MPS-SSM, a theoretically-principled state space model that combines selective mechanisms with information-theoretic regularization based on the principle of minimal predictive sufficiency.
 
 ## Overview
-
+ 
 MPS-SSM addresses the theoretical gap in modern selective state space models (like Mamba) by providing a first-principles approach to designing selective mechanisms. Instead of relying on heuristic designs, MPS-SSM derives its architecture from the fundamental principle that hidden states should be minimal sufficient statistics for predicting the future.
 
 ### Key Features
