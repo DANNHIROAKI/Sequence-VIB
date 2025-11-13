@@ -132,7 +132,7 @@ class SelectiveGate(nn.Module):
         self.register_buffer("delta_table", delta_table)
         self.num_deltas = delta_table.numel()
 
-        output_dim = self.num_deltas + d_state * d_model + d_model * d_state
+        output_dim = self.num_deltas + d_state * d_model + d_model * d_state + d_state
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_size),
             nn.GELU(),
@@ -144,18 +144,32 @@ class SelectiveGate(nn.Module):
         self.register_buffer("B_scale", torch.tensor(0.5))
         self.register_buffer("C_scale", torch.tensor(0.5))
 
-    def forward(
-        self, hidden_t: Tensor, rate_feedback: Optional[Tensor] = None
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, hidden_t: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         gate_out = self.net(hidden_t)
         delta_logits = gate_out[:, : self.num_deltas]
         split_point = self.num_deltas + self.d_state * self.d_model
         B_raw = gate_out[:, self.num_deltas:split_point]
-        C_raw = gate_out[:, split_point:]
+        C_raw = gate_out[:, split_point : split_point + self.d_model * self.d_state]
+        logvar_raw = gate_out[:, split_point + self.d_model * self.d_state :]
 
         mixture = F.softmax(delta_logits, dim=-1)
-        if rate_feedback is not None and self.feedback_cfg.delta_strength > 0:
-            fb = rate_feedback.view(-1, 1)
+        B = torch.tanh(B_raw).view(-1, self.d_state, self.d_model) * self.B_scale
+        C = torch.tanh(C_raw).view(-1, self.d_model, self.d_state) * self.C_scale
+        logvar = logvar_raw.view(-1, self.d_state).clamp(min=-8.0, max=8.0)
+        return mixture, B, C, logvar
+
+    def apply_feedback(
+        self,
+        mixture: Tensor,
+        B: Tensor,
+        C: Tensor,
+        rate_feedback: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        if rate_feedback is None:
+            return mixture, B, C
+
+        fb = rate_feedback.view(-1, 1)
+        if self.feedback_cfg.delta_strength > 0:
             alpha = torch.sigmoid(
                 self.feedback_cfg.kappa * (fb - self.feedback_cfg.beta_norm)
             )
@@ -171,17 +185,16 @@ class SelectiveGate(nn.Module):
             mixture = 0.5 * (mixture + mixture_feedback)
             mixture = mixture / mixture.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
-        delta = torch.sum(mixture * self.delta_table.view(1, -1), dim=-1)
-        B = torch.tanh(B_raw).view(-1, self.d_state, self.d_model) * self.B_scale
-        C = torch.tanh(C_raw).view(-1, self.d_model, self.d_state) * self.C_scale
-
-        if rate_feedback is not None and self.feedback_cfg.matrix_strength > 0:
-            fb = rate_feedback.view(-1, 1, 1)
-            scale = 1.0 / (1.0 + self.feedback_cfg.matrix_strength * fb)
+        if self.feedback_cfg.matrix_strength > 0:
+            fb_scale = rate_feedback.view(-1, 1, 1)
+            scale = 1.0 / (1.0 + self.feedback_cfg.matrix_strength * fb_scale)
             B = B * scale
-            C = C * scale.transpose(1, 2)
+            C = C * scale
 
-        return delta, mixture, B, C
+        return mixture, B, C
+
+    def compute_delta(self, mixture: Tensor) -> Tensor:
+        return torch.sum(mixture * self.delta_table.view(1, -1), dim=-1)
 
 
 class InnovationPredictor(nn.Module):
@@ -209,44 +222,6 @@ class InnovationPredictor(nn.Module):
         x = F.pad(x, (self.padding, 0))
         preds = self.conv(x)
         return preds.transpose(1, 2)
-
-
-class StochasticEncoder(nn.Module):
-    """Variational encoder producing diagonal-Gaussian parameters."""
-
-    def __init__(self, d_model: int, d_state: int) -> None:
-        super().__init__()
-        hidden = max(d_model, d_state)
-        self.mu_net = nn.Sequential(
-            nn.Linear(d_model + d_state, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, d_state),
-        )
-        self.logvar_net = nn.Sequential(
-            nn.Linear(d_model + d_state, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, d_state),
-        )
-
-    def forward(self, state_prev: Tensor, hidden_t: Tensor) -> Tuple[Tensor, Tensor]:
-        enc_input = torch.cat([state_prev, hidden_t], dim=-1)
-        mu = self.mu_net(enc_input)
-        logvar = self.logvar_net(enc_input)
-        return mu, logvar.clamp(min=-8.0, max=8.0)
-
-
-class ConditionalPrior(nn.Module):
-    """Lightweight conditional prior :math:`r_\eta(h_k \mid h_{k-1})`."""
-
-    def __init__(self, d_state: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(d_state, d_state)
-        self.logvar = nn.Parameter(torch.zeros(d_state))
-
-    def forward(self, state_prev: Tensor) -> Tuple[Tensor, Tensor]:
-        mean = self.proj(state_prev)
-        logvar = self.logvar.expand_as(mean)
-        return mean, logvar
 
 
 class MPSSSM(nn.Module):
@@ -323,10 +298,14 @@ class MPSSSM(nn.Module):
             delta_table=self.delta_table,
             feedback_cfg=self.feedback_cfg,
         )
-        self.encoder = StochasticEncoder(d_model, d_state)
-        self.prior = ConditionalPrior(d_state)
+        self.sigma_floor = 1e-3
+        self.prior_logvar = nn.Parameter(torch.zeros(d_state))
 
-        self.register_buffer("A_base", _stable_continuous_dynamics(d_state, torch.device("cpu")))
+        A_base = _stable_continuous_dynamics(d_state, torch.device("cpu"))
+        self.register_buffer("A_base", A_base)
+        A_table, Phi_table = self._precompute_discretization_tables(A_base, self.delta_table)
+        self.register_buffer("A_table", A_table)
+        self.register_buffer("Phi_table", Phi_table)
 
         self.pred_head = nn.Sequential(
             nn.Linear(d_state, d_model),
@@ -341,6 +320,32 @@ class MPSSSM(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, enc_in),
         )
+
+    def _precompute_discretization_tables(
+        self, A: Tensor, delta_table: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Pre-compute exp(A Δ) and \int exp(As) ds for each Δ in the table."""
+
+        device = A.device
+        dtype = A.dtype
+        identity = torch.eye(self.d_state, device=device, dtype=dtype).unsqueeze(0)
+        A_list: List[Tensor] = []
+        Phi_list: List[Tensor] = []
+        for delta in delta_table:
+            delta_tensor = delta.view(1)
+            A_bar, B_bar = van_loan_discretization(A, identity, delta_tensor)
+            A_list.append(A_bar.squeeze(0))
+            Phi_list.append(B_bar.squeeze(0))
+        return torch.stack(A_list, dim=0), torch.stack(Phi_list, dim=0)
+
+    def _mix_table(self, mixture: Tensor, table: Tensor) -> Tensor:
+        return torch.einsum("bq,qij->bij", mixture, table)
+
+    def _combine_dynamics(self, mixture: Tensor, B: Tensor) -> Tuple[Tensor, Tensor]:
+        A_bar = self._mix_table(mixture, self.A_table)
+        Phi = self._mix_table(mixture, self.Phi_table)
+        B_bar = torch.bmm(Phi, B)
+        return A_bar, B_bar
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -358,7 +363,6 @@ class MPSSSM(nn.Module):
             raise ValueError(f"Expected sequence length {self.seq_len}, got {seq_len}")
 
         device = x.device
-        A = self.A_base.to(device)
 
         embedded_inputs = self.layer_norm(self.embed_dropout(self.input_embed(x)))
         innovation_pred = self.innov_predictor(x)
@@ -374,48 +378,63 @@ class MPSSSM(nn.Module):
         delta_terms: List[Tensor] = []
         mixture_terms: List[Tensor] = []
         latent_states: List[Tensor] = []
+        state_samples: List[Tensor] = []
         recon_targets: List[Tensor] = []
         recon_masks: List[Tensor] = []
+        prior_logvar = self.prior_logvar.view(1, -1)
 
         for t in range(seq_len):
             hidden_t = residual_embed[:, t, :]
             mask_t = mask[:, t, :] if mask is not None else None
 
-            mu_q, logvar_q = self.encoder(state_prev, hidden_t)
-            mu_p, logvar_p = self.prior(state_prev)
+            mixture_base, B_base, C_base, logvar = self.gate(hidden_t)
+            drive = hidden_t.unsqueeze(-1)
 
-            eps = torch.randn_like(mu_q)
-            std_q = torch.exp(0.5 * logvar_q)
-            state_sample = mu_q + std_q * eps
+            A_bar_base, B_bar_base = self._combine_dynamics(mixture_base, B_base)
+            mu_prior_base = torch.bmm(A_bar_base, state_prev.unsqueeze(-1)).squeeze(-1)
+            mu_q_base = mu_prior_base + torch.bmm(B_bar_base, drive).squeeze(-1)
+            prior_logvar_expanded = prior_logvar.expand_as(mu_prior_base)
+            rate_feedback_value = gaussian_kl_divergence(
+                mu_q_base, logvar, mu_prior_base, prior_logvar_expanded
+            ).sum(dim=-1)
+            rate_feedback = (rate_feedback_value / self.d_state).unsqueeze(-1).detach()
 
-            rate_step = gaussian_kl_divergence(mu_q, logvar_q, mu_p, logvar_p).sum(dim=-1)
+            mixture, B, C = self.gate.apply_feedback(mixture_base, B_base, C_base, rate_feedback)
+            delta = self.gate.compute_delta(mixture)
+            mixture_terms.append(mixture)
+            delta_terms.append(delta)
+
+            A_bar, B_bar = self._combine_dynamics(mixture, B)
+            A_bar = project_spectral_radius(A_bar, self.spectral_radius)
+            mu_prior = torch.bmm(A_bar, state_prev.unsqueeze(-1)).squeeze(-1)
+            mu_q = mu_prior + torch.bmm(B_bar, drive).squeeze(-1)
+
+            prior_logvar_final = prior_logvar.expand_as(mu_prior)
+            rate_step = gaussian_kl_divergence(mu_q, logvar, mu_prior, prior_logvar_final).sum(dim=-1)
             rate_terms.append(rate_step)
 
-            rate_detached = (rate_step / self.d_state).detach().unsqueeze(-1)
-            delta, mixture, B, C = self.gate(hidden_t, rate_feedback=rate_detached)
-            mixture_terms.append(mixture)
-
-            A_bar, B_bar = van_loan_discretization(A, B, delta)
-            A_bar = project_spectral_radius(A_bar, self.spectral_radius)
-            input_contrib = torch.bmm(B_bar, hidden_t.unsqueeze(-1)).squeeze(-1)
-            state_prev = torch.bmm(A_bar, state_sample.unsqueeze(-1)).squeeze(-1) + input_contrib
+            std_q = torch.exp(0.5 * logvar).clamp(min=self.sigma_floor)
+            eps = torch.randn_like(std_q)
+            state_sample = mu_q + std_q * eps
+            state_prev = state_sample
 
             latent = torch.bmm(C, state_sample.unsqueeze(-1)).squeeze(-1)
             latent_states.append(latent)
+            state_samples.append(state_sample)
             recon_targets.append(x[:, t, :])
             if mask_t is not None:
                 recon_masks.append(mask_t)
-            delta_terms.append(delta)
 
         latent_seq = torch.stack(latent_states, dim=1)
-        final_state = latent_seq[:, -1, :]
+        state_seq = torch.stack(state_samples, dim=1)
+        final_state = state_seq[:, -1, :]
 
         pred_params = self.pred_head(final_state)
         pred_params = pred_params.view(batch_size, self.pred_len, self.enc_in, 2)
         pred_mean = pred_params[..., 0]
         pred_logvar = pred_params[..., 1].clamp(min=-10.0, max=5.0)
 
-        mid_state = latent_seq[:, seq_len // 2, :]
+        mid_state = state_seq[:, seq_len // 2, :]
         reconstruction = self.reconstruction_head(mid_state)
         recon_target = recon_targets[seq_len // 2]
         recon_mask = recon_masks[seq_len // 2] if recon_masks else None
