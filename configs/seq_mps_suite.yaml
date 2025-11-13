@@ -89,8 +89,14 @@ training:
     lr: 2.0e-4
     weight_decay: 1.0e-2
   rate_budget: 0.05
+  rate_budget_inst: 0.05
+  rate_budget_prefix: 0.08
   dual_step: 1.0e-2
+  dual_step_inst: 1.0e-2
+  dual_step_prefix: 1.0e-2
   initial_lambda: 0.0
+  initial_lambda_inst: 0.0
+  initial_lambda_prefix: 0.0
   early_stop_delta: 0.0
 
 model:
@@ -102,6 +108,11 @@ model:
   max_dt: 1.0
   feedback_delta: 0.2
   feedback_matrix: 0.2
+  feedback_beta_norm: 0.05
+  feedback_kappa: 5.0
+  delta_bins: 16
+  innovation_kernel: 5
+  innovation_penalty: 1.0e-4
   spectral_radius: 0.999
 
 evaluation:
