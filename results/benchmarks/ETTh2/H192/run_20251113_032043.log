@@ -1,0 +1,5 @@
+--- Experiment start 2025-11-13T03:20:43.317907 ---
+Dataset: ETTh2 | Horizon: 192
+
+>> Seed 1
+Train:   0%|          | 0/311 [00:00<?, ?it/s]                                              

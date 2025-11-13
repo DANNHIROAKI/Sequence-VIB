@@ -1,0 +1,7 @@
+--- Experiment start 2025-11-13T03:01:05.595630 ---
+Dataset: ETTh2 | Horizon: 96
+
+>> Seed 1
+/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/torch/cuda/__init__.py:827: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+Train:   0%|          | 0/314 [00:00<?, ?it/s]                                              

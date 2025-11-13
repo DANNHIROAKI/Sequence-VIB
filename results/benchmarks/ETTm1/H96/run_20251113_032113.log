@@ -1,0 +1,5 @@
+--- Experiment start 2025-11-13T03:21:13.324500 ---
+Dataset: ETTm1 | Horizon: 96
+
+>> Seed 1
+Train:   0%|          | 0/1294 [00:00<?, ?it/s]                                               

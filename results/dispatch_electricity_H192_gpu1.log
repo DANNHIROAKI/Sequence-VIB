@@ -1,0 +1,26 @@
+Traceback (most recent call last):
+  File "/home/dhy/PhD/Sequence-VIB/run_experiment.py", line 442, in <module>
+    main()
+  File "/home/dhy/PhD/Sequence-VIB/run_experiment.py", line 438, in main
+    runner.run()
+  File "/home/dhy/PhD/Sequence-VIB/run_experiment.py", line 324, in run
+    result = self._train_single_seed(seed)
+  File "/home/dhy/PhD/Sequence-VIB/run_experiment.py", line 151, in _train_single_seed
+    train_loader = get_dataloader(self._build_data_config("train"), mode="train")
+  File "/home/dhy/PhD/Sequence-VIB/data_provider/data_loader.py", line 223, in get_dataloader
+    dataset = TimeSeriesDataset(
+  File "/home/dhy/PhD/Sequence-VIB/data_provider/data_loader.py", line 80, in __init__
+    self._load_and_preprocess()
+  File "/home/dhy/PhD/Sequence-VIB/data_provider/data_loader.py", line 84, in _load_and_preprocess
+    frame = pd.read_csv(self.data_path)
+  File "/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/pandas/io/parsers/readers.py", line 1026, in read_csv
+    return _read(filepath_or_buffer, kwds)
+  File "/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/pandas/io/parsers/readers.py", line 620, in _read
+    parser = TextFileReader(filepath_or_buffer, **kwds)
+  File "/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/pandas/io/parsers/readers.py", line 1620, in __init__
+    self._engine = self._make_engine(f, self.engine)
+  File "/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/pandas/io/parsers/readers.py", line 1880, in _make_engine
+    self.handles = get_handle(
+  File "/home/dhy/anaconda3/envs/VIB/lib/python3.10/site-packages/pandas/io/common.py", line 873, in get_handle
+    handle = open(
+FileNotFoundError: [Errno 2] No such file or directory: 'data/electricity/electricity.csv'
