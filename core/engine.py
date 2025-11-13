@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -36,6 +36,9 @@ def train_one_epoch(
         "mae": 0.0,
         "nll": 0.0,
         "crps": 0.0,
+        "inst": 0.0,
+        "prefix": 0.0,
+        "innovation": 0.0,
     }
     num_batches = 0
     num_samples = 0
@@ -47,10 +50,16 @@ def train_one_epoch(
             batch = _to_device(batch, device)
             outputs = model(batch)
 
+            constraint_cfg = {
+                "lambda_inst": dual_state["lambda_inst"],
+                "lambda_prefix": dual_state["lambda_prefix"],
+                "beta_inst": dual_state["beta_inst"],
+                "beta_prefix": dual_state["beta_prefix"],
+            }
             losses = model.compute_loss(
                 outputs,
                 batch["targets"],
-                lambda_val=dual_state["lambda"],
+                constraint_cfg=constraint_cfg,
                 target_mask=batch.get("target_mask"),
             )
 
@@ -60,11 +69,17 @@ def train_one_epoch(
             optimizer.step()
 
             with torch.no_grad():
-                avg_rate = losses["avg_rate"].item()
-                dual_state["lambda"] = max(
+                inst_violation = losses["inst_violation"].item()
+                prefix_violation = losses["prefix_violation"].item()
+                dual_state["lambda_inst"] = max(
                     0.0,
-                    dual_state["lambda"]
-                    + dual_state["dual_step"] * (avg_rate - dual_state["rate_budget"]),
+                    dual_state["lambda_inst"]
+                    + dual_state["dual_step_inst"] * inst_violation,
+                )
+                dual_state["lambda_prefix"] = max(
+                    0.0,
+                    dual_state["lambda_prefix"]
+                    + dual_state["dual_step_prefix"] * prefix_violation,
                 )
 
             batch_size = batch["inputs"].shape[0]
@@ -78,12 +93,16 @@ def train_one_epoch(
             stats["mae"] += losses["mae"].item()
             stats["nll"] += losses["nll"].item()
             stats["crps"] += losses["crps"].item()
+            stats["inst"] += losses["inst_violation"].item()
+            stats["prefix"] += losses["prefix_violation"].item()
+            stats["innovation"] += losses["innovation_loss"].item()
             num_batches += 1
 
             progress.set_postfix(
                 loss=f"{stats['loss']/num_batches:.4f}",
                 rate=f"{stats['rate']/num_batches:.4f}",
-                lam=f"{dual_state['lambda']:.3f}",
+                lam_i=f"{dual_state['lambda_inst']:.3f}",
+                lam_p=f"{dual_state['lambda_prefix']:.3f}",
             )
 
     elapsed = time.perf_counter() - start_time
@@ -92,7 +111,8 @@ def train_one_epoch(
 
     for key in stats:
         stats[key] /= max(1, num_batches)
-    stats["lambda"] = dual_state["lambda"]
+    stats["lambda_inst"] = dual_state["lambda_inst"]
+    stats["lambda_prefix"] = dual_state["lambda_prefix"]
     stats["throughput"] = throughput
     stats["peak_mem"] = peak_mem
     stats["elapsed"] = elapsed
@@ -103,6 +123,7 @@ def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    constraint_cfg: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     model.eval()
     stats = {
@@ -113,8 +134,18 @@ def evaluate(
         "mae": 0.0,
         "nll": 0.0,
         "crps": 0.0,
+        "inst": 0.0,
+        "prefix": 0.0,
+        "innovation": 0.0,
     }
     num_batches = 0
+
+    constraint_cfg = constraint_cfg or {
+        "lambda_inst": 0.0,
+        "lambda_prefix": 0.0,
+        "beta_inst": 0.0,
+        "beta_prefix": 0.0,
+    }
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", leave=False):
@@ -123,7 +154,7 @@ def evaluate(
             losses = model.compute_loss(
                 outputs,
                 batch["targets"],
-                lambda_val=0.0,
+                constraint_cfg=constraint_cfg,
                 target_mask=batch.get("target_mask"),
             )
 
@@ -134,6 +165,9 @@ def evaluate(
             stats["mae"] += losses["mae"].item()
             stats["nll"] += losses["nll"].item()
             stats["crps"] += losses["crps"].item()
+            stats["inst"] += losses["inst_violation"].item()
+            stats["prefix"] += losses["prefix_violation"].item()
+            stats["innovation"] += losses["innovation_loss"].item()
             num_batches += 1
 
     for key in stats:

@@ -40,7 +40,8 @@ from models.mps_ssm import MPSSSM
 class TrainingResult:
     seed: int
     best_val: float
-    final_lambda: float
+    final_lambda_inst: float
+    final_lambda_prefix: float
     train_history: List[Dict[str, float]]
     test_metrics: Dict[str, float]
     throughput: float
@@ -87,6 +88,27 @@ class ExperimentRunner:
             return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         raise ValueError(f"Unsupported optimizer: {name}")
 
+    def _constraint_defaults(self) -> Dict[str, float]:
+        beta_inst = self.training_cfg.get("rate_budget_inst", self.training_cfg.get("rate_budget", 0.05))
+        beta_prefix = self.training_cfg.get("rate_budget_prefix", beta_inst)
+        return {
+            "lambda_inst": self.training_cfg.get("initial_lambda_inst", self.training_cfg.get("initial_lambda", 0.0)),
+            "lambda_prefix": self.training_cfg.get("initial_lambda_prefix", self.training_cfg.get("initial_lambda", 0.0)),
+            "beta_inst": beta_inst,
+            "beta_prefix": beta_prefix,
+            "dual_step_inst": self.training_cfg.get("dual_step_inst", self.training_cfg.get("dual_step", 0.01)),
+            "dual_step_prefix": self.training_cfg.get("dual_step_prefix", self.training_cfg.get("dual_step", 0.01)),
+        }
+
+    def _eval_constraint_cfg(self) -> Dict[str, float]:
+        defaults = self._constraint_defaults()
+        return {
+            "lambda_inst": 0.0,
+            "lambda_prefix": 0.0,
+            "beta_inst": defaults["beta_inst"],
+            "beta_prefix": defaults["beta_prefix"],
+        }
+
     def _build_data_config(self, mode: str, noise_fn: Optional[Any] = None) -> Dict[str, Any]:
         cfg = {
             **self.dataset_cfg,
@@ -114,6 +136,11 @@ class ExperimentRunner:
             max_dt=self.model_cfg.get("max_dt", 1.0),
             feedback_delta=self.model_cfg.get("feedback_delta", 0.1),
             feedback_matrix=self.model_cfg.get("feedback_matrix", 0.1),
+            feedback_beta_norm=self.model_cfg.get("feedback_beta_norm", 0.05),
+            feedback_kappa=self.model_cfg.get("feedback_kappa", 5.0),
+            delta_bins=self.model_cfg.get("delta_bins", 8),
+            innovation_kernel=self.model_cfg.get("innovation_kernel", 3),
+            innovation_penalty=self.model_cfg.get("innovation_penalty", 1e-4),
             dropout=self.model_cfg.get("dropout", 0.1),
             spectral_radius=self.model_cfg.get("spectral_radius", 0.999),
         )
@@ -128,11 +155,7 @@ class ExperimentRunner:
         model = self._create_model()
         optimizer = self._optimizer(model)
 
-        dual_state = {
-            "lambda": self.training_cfg.get("initial_lambda", 0.0),
-            "rate_budget": self.training_cfg.get("rate_budget", 0.05),
-            "dual_step": self.training_cfg.get("dual_step", 0.01),
-        }
+        dual_state = self._constraint_defaults()
 
         checkpoint_path = self.checkpoint_dir / f"seed{seed}.pth"
         early_stopping = EarlyStopping(
@@ -143,25 +166,35 @@ class ExperimentRunner:
 
         history: List[Dict[str, float]] = []
         best_val = float("inf")
-        best_lambda = dual_state["lambda"]
+        best_lambda_inst = dual_state["lambda_inst"]
+        best_lambda_prefix = dual_state["lambda_prefix"]
         last_train_stats: Dict[str, float] = {}
         grad_clip = self.training_cfg.get("grad_clip", 1.0)
 
         for epoch in range(1, self.training_cfg.get("max_epochs", 50) + 1):
             train_stats = train_one_epoch(model, train_loader, optimizer, self.device, dual_state, grad_clip)
-            val_stats = evaluate(model, val_loader, self.device)
+            val_stats = evaluate(
+                model,
+                val_loader,
+                self.device,
+                constraint_cfg=self._eval_constraint_cfg(),
+            )
 
             epoch_record = {
                 "epoch": epoch,
                 "train_loss": train_stats["loss"],
                 "train_rate": train_stats["rate"],
                 "val_pred": val_stats["pred_loss"],
-                "lambda": dual_state["lambda"],
+                "lambda_inst": dual_state["lambda_inst"],
+                "lambda_prefix": dual_state["lambda_prefix"],
                 "throughput": train_stats.get("throughput", 0.0),
                 "peak_mem": train_stats.get("peak_mem", 0.0),
                 "elapsed": train_stats.get("elapsed", 0.0),
                 "train_nll": train_stats.get("nll", 0.0),
                 "train_crps": train_stats.get("crps", 0.0),
+                "train_inst": train_stats.get("inst", 0.0),
+                "train_prefix": train_stats.get("prefix", 0.0),
+                "train_innovation": train_stats.get("innovation", 0.0),
             }
             history.append(epoch_record)
             last_train_stats = train_stats
@@ -171,7 +204,8 @@ class ExperimentRunner:
 
             if val_metric < best_val:
                 best_val = val_metric
-                best_lambda = dual_state["lambda"]
+                best_lambda_inst = dual_state["lambda_inst"]
+                best_lambda_prefix = dual_state["lambda_prefix"]
 
             if early_stopping.early_stop:
                 break
@@ -179,7 +213,8 @@ class ExperimentRunner:
         if early_stopping.best_model_state is not None:
             model.load_state_dict(early_stopping.best_model_state)
 
-        test_metrics = evaluate(model, test_loader, self.device)
+        eval_constraints = self._eval_constraint_cfg()
+        test_metrics = evaluate(model, test_loader, self.device, constraint_cfg=eval_constraints)
 
         latency_ms = self._measure_latency(model, test_loader)
         robustness = self._evaluate_robustness(model, test_loader, base_mse=test_metrics["mse"])
@@ -187,7 +222,8 @@ class ExperimentRunner:
         return TrainingResult(
             seed=seed,
             best_val=float(best_val),
-            final_lambda=float(best_lambda),
+            final_lambda_inst=float(best_lambda_inst),
+            final_lambda_prefix=float(best_lambda_prefix),
             train_history=history,
             test_metrics={k: float(v) for k, v in test_metrics.items()},
             throughput=float(last_train_stats.get("throughput", 0.0)),
@@ -221,10 +257,12 @@ class ExperimentRunner:
         base_dataset = test_loader.dataset
         scale = getattr(base_dataset.scaler, "scale_", np.ones(base_dataset.data.shape[1]))
 
+        eval_constraints = self._eval_constraint_cfg()
+
         def evaluate_with_noise(name: str, noise_fn: Any) -> Dict[str, float]:
             cfg = self._build_data_config("test", noise_fn=noise_fn)
             loader = get_dataloader(cfg, mode="test")
-            metrics = evaluate(model, loader, self.device)
+            metrics = evaluate(model, loader, self.device, constraint_cfg=eval_constraints)
             mse = metrics["mse"]
             return {
                 "mse": float(mse),
@@ -296,7 +334,8 @@ class ExperimentRunner:
     # ------------------------------------------------------------------
     def _write_summary(self, results: List[TrainingResult]) -> None:
         metric_lists: Dict[str, List[float]] = defaultdict(list)
-        lambda_values: List[float] = []
+        lambda_inst_values: List[float] = []
+        lambda_prefix_values: List[float] = []
         throughputs: List[float] = []
         latencies: List[float] = []
         peak_mems: List[float] = []
@@ -304,7 +343,8 @@ class ExperimentRunner:
         robustness_lists: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
 
         for res in results:
-            lambda_values.append(res.final_lambda)
+            lambda_inst_values.append(res.final_lambda_inst)
+            lambda_prefix_values.append(res.final_lambda_prefix)
             for key, value in res.test_metrics.items():
                 metric_lists[key].append(value)
             for scen, vals in res.robustness.items():
@@ -328,9 +368,16 @@ class ExperimentRunner:
             "model_size_mb": model_size_mb,
             "metrics": summarise_metrics(metric_lists),
             "lambda": {
-                "mean": float(np.mean(lambda_values)),
-                "std": float(np.std(lambda_values)),
-                "per_seed": lambda_values,
+                "inst": {
+                    "mean": float(np.mean(lambda_inst_values)),
+                    "std": float(np.std(lambda_inst_values)),
+                    "per_seed": lambda_inst_values,
+                },
+                "prefix": {
+                    "mean": float(np.mean(lambda_prefix_values)),
+                    "std": float(np.std(lambda_prefix_values)),
+                    "per_seed": lambda_prefix_values,
+                },
             },
             "resources": {
                 "throughput": summarise_metrics({"throughput": throughputs}).get("throughput", {}),
@@ -360,7 +407,8 @@ class ExperimentRunner:
                     {
                         "seed": res.seed,
                         "best_val": res.best_val,
-                        "final_lambda": res.final_lambda,
+                        "final_lambda_inst": res.final_lambda_inst,
+                        "final_lambda_prefix": res.final_lambda_prefix,
                         "test_metrics": res.test_metrics,
                         "robustness": res.robustness,
                         "history": res.train_history,
